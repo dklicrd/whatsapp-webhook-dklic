@@ -168,7 +168,7 @@ function buildSystemPrompt() {
   return `Eres un asistente de ventas profesional de DKLIC PLUS INVESTMENT, especializado en puertas cortafuego y accesorios de seguridad.
 
 EMPRESA: DKLIC PLUS INVESTMENT
-ASESOR: Alejandro Plasencia
+ASESOR: Ricardo M Vega
 TELÉFONO: +1 (809) 555-0100
 EMAIL: ventas@dklicrd.com
 
