@@ -59,6 +59,10 @@ const INSTALL_PRICE_PER_DOOR = 93.50; // RD$ por puerta
 // CONVERSACIONES EN MEMORIA (sin base de datos)
 // ============================================================
 const conversations = new Map(); // waId -> [{ role, content }]
+const pendingQuotations = new Map(); // quotationId -> { clientWaId, data, status }
+const quotationCounter = { value: 1000 };
+
+const OWNER_PHONE = '18093839972'; // Número del propietario sin + ni espacios
 
 function getHistory(waId) {
   if (!conversations.has(waId)) {
@@ -74,6 +78,11 @@ function addToHistory(waId, role, content) {
   if (history.length > 20) {
     history.splice(0, history.length - 20);
   }
+}
+
+function createQuotationId() {
+  quotationCounter.value++;
+  return `COT-${quotationCounter.value}`;
 }
 
 // ============================================================
@@ -222,6 +231,16 @@ ESTRATEGIA DE CONVERSACIÓN:
      * Fecha
      * Detalles de productos y precios
      * Términos de pago: 50% anticipo, 50% contra entrega
+   - IMPORTANTE: Al finalizar la cotización, incluye la palabra ITBIS en tu respuesta
+   - Esto activará el flujo de aprobación automático
+
+4. FLUJO DE APROBACIÓN (automático):
+   - Cuando completes una cotización, el sistema enviará automáticamente:
+     * La cotización al propietario para aprobación
+     * Un mensaje al cliente: Su solicitud de cotización ha sido recibida. En breve recibirá su cotización formal. Gracias por contactar a DKLIC PLUS INVESTMENT!
+   - El propietario responderá con APROBAR o RECHAZAR
+   - Si APROBAR: se enviará la cotización completa al cliente
+   - Si RECHAZAR: se notificará al cliente
 
 CATÁLOGO COMPLETO (usar solo cuando se solicite):
 ${productList}
@@ -399,6 +418,16 @@ async function processMessage(body) {
 
       console.log(`[Webhook] Message from ${waId}: "${text}"`);
 
+      // Verificar si es el propietario respondiendo a una cotización
+      if (waId === OWNER_PHONE) {
+        const upperText = text.toUpperCase().trim();
+        if (upperText === 'APROBAR' || upperText === 'RECHAZAR') {
+          console.log(`[Owner] ${upperText} command from owner`);
+          await handleOwnerResponse(waId, upperText);
+          continue;
+        }
+      }
+
       // Obtener historial de conversación
       const history = getHistory(waId);
 
@@ -418,6 +447,14 @@ async function processMessage(body) {
         // Enviar respuesta por WhatsApp
         await sendWhatsAppMessage(waId, response);
         console.log(`[Webhook] ✅ Response sent to ${waId}`);
+        
+        // Verificar si la respuesta contiene indicador de cotización completa
+        if (response.includes('ITBIS') && response.includes('TOTAL')) {
+          // Enviar mensaje de confirmación al cliente
+          await sendWhatsAppMessage(waId, 'Su solicitud de cotización ha sido recibida. En breve recibirá su cotización formal. ¡Gracias por contactar a DKLIC PLUS INVESTMENT!');
+          // Enviar a aprobación del propietario
+          await handleQuotationReady(waId, response);
+        }
 
       } catch (err) {
         console.error('[Webhook] Error generating/sending response:', err.message);
@@ -434,6 +471,96 @@ async function processMessage(body) {
     }
   } catch (err) {
     console.error('[Webhook] Fatal error:', err);
+  }
+}
+
+// ============================================================
+// MANEJO DE APROBACIÓN/RECHAZO DE COTIZACIONES
+// ============================================================
+async function handleQuotationReady(clientWaId, quotationText) {
+  try {
+    // Crear ID de cotización
+    const quotationId = createQuotationId();
+    
+    // Guardar cotización pendiente
+    pendingQuotations.set(quotationId, {
+      clientWaId,
+      quotationText,
+      status: 'pending',
+      createdAt: new Date()
+    });
+    
+    console.log(`[Quotation] Created quotation ${quotationId} for client ${clientWaId}`);
+    
+    // Enviar a aprobación del propietario
+    const approvalMessage = `📋 *COTIZACIÓN PENDIENTE DE APROBACIÓN*\n\nCliente: ${clientWaId}\nCotización ID: ${quotationId}\n\n${quotationText}\n\nResponde *APROBAR* para enviarla al cliente o *RECHAZAR* para cancelarla.`;
+    
+    await sendWhatsAppMessage(OWNER_PHONE, approvalMessage);
+    console.log(`[Quotation] Approval request sent to owner for ${quotationId}`);
+    
+    // Guardar el ID de cotización en la conversación del cliente para referencia futura
+    addToHistory(clientWaId, 'system', `quotation_id:${quotationId}`);
+    
+  } catch (err) {
+    console.error('[Quotation] Error handling quotation:', err.message);
+  }
+}
+
+async function handleOwnerResponse(ownerWaId, action) {
+  try {
+    // Encontrar la cotización más reciente pendiente
+    let quotationId = null;
+    let quotationData = null;
+    
+    for (const [qId, qData] of pendingQuotations.entries()) {
+      if (qData.status === 'pending') {
+        quotationId = qId;
+        quotationData = qData;
+        break;
+      }
+    }
+    
+    if (!quotationId || !quotationData) {
+      await sendWhatsAppMessage(ownerWaId, '❌ No hay cotizaciones pendientes de aprobación.');
+      return;
+    }
+    
+    if (action === 'APROBAR') {
+      // Aprobar cotización
+      quotationData.status = 'approved';
+      
+      // Enviar cotización al cliente
+      const clientMessage = `✅ *SU COTIZACIÓN HA SIDO APROBADA*\n\n${quotationData.quotationText}\n\nPara confirmar su pedido, por favor contáctenos al +1 (809) 555-0100 o a ventas@dklicrd.com`;
+      
+      await sendWhatsAppMessage(quotationData.clientWaId, clientMessage);
+      
+      // Confirmar al propietario
+      await sendWhatsAppMessage(ownerWaId, `✅ Cotización ${quotationId} enviada al cliente.`);
+      
+      console.log(`[Quotation] Quotation ${quotationId} approved and sent to client`);
+      
+    } else if (action === 'RECHAZAR') {
+      // Rechazar cotización
+      quotationData.status = 'rejected';
+      
+      // Notificar al cliente
+      const clientMessage = `⚠️ Su solicitud de cotización ha sido revisada. Por favor contáctenos directamente al +1 (809) 555-0100 para más información.`;
+      
+      await sendWhatsAppMessage(quotationData.clientWaId, clientMessage);
+      
+      // Confirmar al propietario
+      await sendWhatsAppMessage(ownerWaId, `❌ Cotización ${quotationId} rechazada.`);
+      
+      console.log(`[Quotation] Quotation ${quotationId} rejected`);
+    }
+    
+  } catch (err) {
+    console.error('[Owner] Error handling owner response:', err.message);
+    try {
+      await sendWhatsAppMessage(ownerWaId, '❌ Error procesando la solicitud. Intente de nuevo.');
+    } catch (e) {
+      console.error('[Owner] Error sending error message:', e.message);
+    }
   }
 }
 
