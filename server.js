@@ -62,6 +62,26 @@ const conversations = new Map(); // waId -> [{ role, content }]
 const pendingQuotations = new Map(); // quotationId -> { clientWaId, data, status }
 const quotationCounter = { value: 1000 };
 
+// ============================================================
+// FIX PROBLEMA 1: Deduplicación de mensajes
+// Meta puede reenviar el mismo mensaje si no recibe 200 OK a tiempo.
+// Guardamos los IDs de mensajes ya procesados para evitar duplicados.
+// ============================================================
+const processedMessageIds = new Set();
+const MESSAGE_ID_TTL_MS = 5 * 60 * 1000; // 5 minutos de memoria
+
+function isMessageAlreadyProcessed(messageId) {
+  return processedMessageIds.has(messageId);
+}
+
+function markMessageAsProcessed(messageId) {
+  processedMessageIds.add(messageId);
+  // Limpiar el ID después de 5 minutos para no acumular memoria
+  setTimeout(() => {
+    processedMessageIds.delete(messageId);
+  }, MESSAGE_ID_TTL_MS);
+}
+
 const OWNER_PHONE = '18093839972'; // Número del propietario sin + ni espacios
 
 function getHistory(waId) {
@@ -97,12 +117,14 @@ async function callGemini(systemPrompt, history, userMessage) {
   // Construir contenidos para Gemini
   const contents = [];
 
-  // Agregar historial previo
+  // Agregar historial previo (excluyendo el mensaje actual)
   for (const msg of history) {
-    contents.push({
-      role: msg.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: msg.content }]
-    });
+    if (msg.role === 'user' || msg.role === 'assistant') {
+      contents.push({
+        role: msg.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: msg.content }]
+      });
+    }
   }
 
   // Agregar mensaje actual del usuario
@@ -111,98 +133,122 @@ async function callGemini(systemPrompt, history, userMessage) {
     parts: [{ text: userMessage }]
   });
 
-  const payload = JSON.stringify({
-    contents,
-    systemInstruction: {
+  const requestBody = JSON.stringify({
+    system_instruction: {
       parts: [{ text: systemPrompt }]
     },
+    contents: contents,
     generationConfig: {
+      temperature: 0.7,
       maxOutputTokens: 1024,
-      temperature: 0.7
     }
   });
 
-  return new Promise((resolve, reject) => {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-    const urlObj = new URL(url);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
 
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
     const options = {
       hostname: urlObj.hostname,
       path: urlObj.pathname + urlObj.search,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload)
+        'Content-Length': Buffer.byteLength(requestBody)
       }
     };
+
+    console.log('[Gemini] Calling API with model: gemini-2.5-flash');
 
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', chunk => { data += chunk; });
       res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (res.statusCode !== 200) {
-            console.error('[Gemini] Error response:', data);
-            reject(new Error(`Gemini API error ${res.statusCode}: ${data}`));
-            return;
+        console.log('[Gemini] Response status:', res.statusCode);
+        if (res.statusCode === 200) {
+          try {
+            const parsed = JSON.parse(data);
+            const text = parsed?.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (text) {
+              resolve(text);
+            } else {
+              console.error('[Gemini] Unexpected response structure:', data.substring(0, 300));
+              reject(new Error('No text in Gemini response'));
+            }
+          } catch (e) {
+            reject(new Error('Failed to parse Gemini response: ' + e.message));
           }
-          const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (!text) {
-            console.error('[Gemini] No text in response:', JSON.stringify(parsed));
-            reject(new Error('No text in Gemini response'));
-            return;
-          }
-          resolve(text);
-        } catch (e) {
-          reject(new Error(`Failed to parse Gemini response: ${e.message}`));
+        } else {
+          console.error('[Gemini] Error response:', data.substring(0, 300));
+          reject(new Error(`Gemini API error ${res.statusCode}: ${data}`));
         }
       });
     });
 
-    req.on('error', reject);
-    req.write(payload);
+    req.on('error', (err) => {
+      console.error('[Gemini] Request error:', err);
+      reject(err);
+    });
+
+    req.write(requestBody);
     req.end();
   });
 }
 
 // ============================================================
 // SISTEMA PROMPT DEL CHATBOT
+// FIX PROBLEMA 2: Prompt reforzado para las 6 categorías
 // ============================================================
 function buildSystemPrompt() {
   const productList = PRODUCTS.map(p =>
     `- ${p.brand} ${p.model}: ${p.description} - $${p.price.toFixed(2)} USD`
   ).join('\n');
 
-  return `Eres un asistente de ventas profesional de DKLIC PLUS INVESTMENT, especializado en soluciones integrales de seguridad, puertas, particiones y accesorios para espacios comerciales, industriales y hoteleros.
+  return `Eres un asistente de ventas profesional de DKLIC PLUS INVESTMENT.
 
 EMPRESA: DKLIC PLUS INVESTMENT
 ASESOR: Ricardo M Vega
 TELÉFONO: +1 (809) 555-0100
 EMAIL: ventas@dklicrd.com
+SITIO WEB: https://dklicrd.com
 
-⚠️ REGLA ABSOLUTA Y ESTRICTA - POLÍTICA DE PRECIOS:
 ════════════════════════════════════════════════════════════
-NUNCA MOSTRAR PRECIOS en ninguna respuesta, EXCEPTO cuando:
-- El cliente haya dicho explícitamente: "quiero una cotización",
-  "necesito cotización", "cuánto cuesta", "dame un presupuesto",
-  "precio", o palabras similares que indiquen solicitud de cotización.
+⚠️ ALCANCE DE TU TRABAJO - MUY IMPORTANTE:
+════════════════════════════════════════════════════════════
+Representas a DKLIC PLUS INVESTMENT y puedes atender consultas
+sobre LAS SIGUIENTES 6 CATEGORÍAS DE PRODUCTOS:
 
-Si el cliente pregunta por productos SIN solicitar cotización:
-✓ Describe brevemente las características del producto
-✓ Menciona los modelos disponibles (SIN PRECIOS)
-✓ Pregunta si desea una cotización formal
-✗ NUNCA incluyas precios en la respuesta
+1. Cerraduras Inteligentes
+2. Puertas Metálicas Cortafuego
+3. Divisiones de Baños
+4. Particiones Móviles Acústicas
+5. Productos para Hoteles
+6. Particiones de Vidrio
+
+NUNCA digas que solo manejas puertas cortafuego.
+NUNCA rechaces una consulta sobre las otras categorías.
+SIEMPRE responde con información útil sobre cualquiera de las 6 categorías.
+════════════════════════════════════════════════════════════
+
+════════════════════════════════════════════════════════════
+⚠️ REGLA ABSOLUTA - POLÍTICA DE PRECIOS:
+════════════════════════════════════════════════════════════
+NUNCA MOSTRAR PRECIOS en ninguna respuesta, EXCEPTO cuando
+el cliente diga explícitamente: "quiero una cotización",
+"necesito cotización", "cuánto cuesta", "dame un presupuesto",
+"precio", o palabras similares.
+
+✗ NUNCA incluyas precios en respuestas informativas
 ✗ NUNCA muestres valores en dólares o pesos
 ✗ NUNCA menciones ITBIS o cálculos de precios
+✓ Cuando el cliente pregunte por productos: describe características (SIN PRECIOS)
+✓ Siempre ofrece: "¿Desea que le prepare una cotización formal?"
 ════════════════════════════════════════════════════════════
 
 ESTRATEGIA DE CONVERSACIÓN:
 
 1. PRIMER CONTACTO / SALUDOS:
-   - Responde de forma breve y amigable
-   - Preséntate como asesor de DKLIC PLUS INVESTMENT
-   - Envía EXACTAMENTE este mensaje de bienvenida:
+   Envía EXACTAMENTE este mensaje de bienvenida:
 
    👋 ¡Bienvenido a *DKLIC PLUS INVESTMENT*!
    
@@ -230,20 +276,17 @@ ESTRATEGIA DE CONVERSACIÓN:
    
    ¿Sobre cuál de estas categorías le gustaría más información?
 
-   - NO muestres precios ni detalles de modelos en el primer contacto
-   - NUNCA incluyas precios en tus respuestas iniciales
-
 2. CONVERSACIÓN NATURAL:
    - Escucha lo que el cliente necesita
    - Haz preguntas para entender mejor su proyecto
    - Sugiere opciones según sus necesidades
    - Mantén un tono conversacional y amigable
-   - NUNCA menciones precios a menos que el cliente lo solicite explícitamente
-   - Si pregunta por un producto específico, describe características y modelos (SIN PRECIOS)
+   - NUNCA menciones precios a menos que el cliente lo solicite
+   - Si pregunta por un producto, describe características (SIN PRECIOS)
    - Siempre ofrece: "¿Desea que le prepare una cotización formal con precios?"
 
 3. CUANDO CLIENTE SOLICITE COTIZACIÓN FORMAL:
-   - Envía EXACTAMENTE este mensaje:
+   Envía EXACTAMENTE este mensaje:
    
    Para preparar su cotización formal, necesito los siguientes datos:
    
@@ -252,9 +295,9 @@ ESTRATEGIA DE CONVERSACIÓN:
    - Email de contacto
    
    *Detalles del producto:*
-   - Tipo de puerta/s
+   - Tipo de producto/s
    - Cantidad/es
-   - Dimensiones (ancho/alto)
+   - Dimensiones (ancho/alto) si aplica
    
    *Accesorios (indicar si aplica):*
    - Barras antipánico
@@ -263,98 +306,79 @@ ESTRATEGIA DE CONVERSACIÓN:
    
    - ¿Incluye instalación? Si es así, especificar ubicación aproximada.
    
-   - Una vez el cliente proporcione todos los datos:
-     * Calcula: Subtotal = suma de precios de productos + accesorios
-     * ITBIS = Subtotal × 0.18
-     * Instalación = cantidad de puertas × RD$93.50 (si aplica)
-     * TOTAL = Subtotal + ITBIS + Instalación
-   - Presenta la cotización profesional con:
-     * Empresa: DKLIC PLUS INVESTMENT
-     * Asesor: Ricardo M Vega
-     * Fecha
-     * Detalles de productos y precios
-     * Términos de pago: 50% anticipo, 50% contra entrega
-   - IMPORTANTE: Al finalizar la cotización, incluye la palabra ITBIS en tu respuesta
-   - Esto activará el flujo de aprobación automático
+   Una vez el cliente proporcione todos los datos:
+   * Calcula: Subtotal = suma de precios de productos + accesorios
+   * ITBIS = Subtotal × 0.18
+   * Instalación = cantidad de puertas × RD$93.50 (si aplica)
+   * TOTAL = Subtotal + ITBIS + Instalación
+   Presenta la cotización profesional con empresa, asesor, fecha, detalles y términos.
+   IMPORTANTE: Al finalizar la cotización, incluye la palabra ITBIS en tu respuesta.
 
-4. BASE DE CONOCIMIENTO - LAS 6 CATEGORÍAS DE PRODUCTOS:
-   Puedes responder preguntas sobre CUALQUIERA de estas categorías con el detalle siguiente:
+════════════════════════════════════════════════════════════
+BASE DE CONOCIMIENTO - LAS 6 CATEGORÍAS:
+════════════════════════════════════════════════════════════
 
-   🔐 CERRADURAS INTELIGENTES (DK-UltraPlus)
-   • Modelo principal: DK-UltraPlus Slim
-   • Métodos de desbloqueo: Huella dactilar, PIN, App móvil, NFC, Llave mecánica
-   • Capacidad: hasta 100 huellas dactilares
-   • Conectividad: Wi-Fi + Bluetooth 5.2
-   • Resistencia: IP65 (agua y polvo)
-   • Seguridad: Cifrado AES-256 (estándar militar)
-   • Garantía: 5 años
-   • Aplicaciones: hogares, oficinas, hoteles, negocios
-   • Enlace: https://dklicrd.com/cerraduras-inteligentes.html
+🔐 CERRADURAS INTELIGENTES (DK-UltraPlus)
+• Modelo principal: DK-UltraPlus Slim
+• Métodos de desbloqueo: Huella dactilar, PIN, App móvil, NFC, Llave mecánica
+• Capacidad: hasta 100 huellas dactilares
+• Conectividad: Wi-Fi + Bluetooth 5.2
+• Resistencia: IP65 (agua y polvo)
+• Seguridad: Cifrado AES-256 (estándar militar)
+• Garantía: 5 años
+• Aplicaciones: hogares, oficinas, hoteles, negocios
+• Enlace: https://dklicrd.com/cerraduras-inteligentes.html
 
-   🚪 PUERTAS METÁLICAS CORTAFUEGO
-   • Certificaciones: UL y CE (estándares internacionales)
-   • Resistencia al fuego: 30, 60, 90 y 120 minutos (RF-30/60/90/120)
-   • Normas: UL/ANSI hasta 3 horas, EI-30/EI-60/EI-90/EI-120
-   • Material: Acero galvanizado de alta densidad
-   • Acabado: Pintura Epoxy 120 micras (resistente a corrosión)
-   • Características: Aislamiento térmico, herrajes certificados, variedad de medidas
-   • Marcas disponibles: Asturmadi, Alvarez, Mesker
-   • Aplicaciones: edificios comerciales, hospitales, hoteles, industria
-   • Enlace: https://dklicrd.com/puertas_metalicas.html
+🚪 PUERTAS METÁLICAS CORTAFUEGO
+• Certificaciones: UL y CE (estándares internacionales)
+• Resistencia al fuego: 30, 60, 90 y 120 minutos (RF-30/60/90/120)
+• Normas: UL/ANSI hasta 3 horas, EI-30/EI-60/EI-90/EI-120
+• Material: Acero galvanizado de alta densidad
+• Acabado: Pintura Epoxy 120 micras (resistente a corrosión)
+• Marcas disponibles: Asturmadi, Alvarez, Mesker
+• Aplicaciones: edificios comerciales, hospitales, hoteles, industria
+• Enlace: https://dklicrd.com/puertas_metalicas.html
 
-   🚹 DIVISIONES DE BAÑOS
-   • Sistemas de tabiques y divisiones para baños públicos y privados
-   • Materiales: acero inoxidable, aluminio, fenol compact, HPL
-   • Configuraciones: montaje en piso, colgante, semi-colgante
-   • Acabados: múltiples colores y texturas disponibles
-   • Resistencia: humedad, golpes y uso intensivo
-   • Aplicaciones: centros comerciales, oficinas, hoteles, restaurantes, estadios
-   • Enlace: https://dklicrd.com/Divisiones_Banos.html
+🚹 DIVISIONES DE BAÑOS
+• Sistemas de tabiques y divisiones para baños públicos y privados
+• Materiales: acero inoxidable, aluminio, fenol compact, HPL
+• Configuraciones: montaje en piso, colgante, semi-colgante
+• Acabados: múltiples colores y texturas disponibles
+• Resistencia: humedad, golpes y uso intensivo
+• Aplicaciones: centros comerciales, oficinas, hoteles, restaurantes, estadios
+• Enlace: https://dklicrd.com/Divisiones_Banos.html
 
-   🏛️ PARTICIONES MÓVILES ACÚSTICAS
-   • Sistemas de divisiones móviles y plegables
-   • Aislamiento acústico: hasta 52 dB de reducción de ruido
-   • Operación: manual o motorizada
-   • Acabados: tela, madera, laminado, vidrio
-   • Altura: hasta 6 metros
-   • Aplicaciones: salas de conferencias, hoteles, auditorios, colegios, restaurantes
-   • Enlace: https://dklicrd.com/Particiones_Acusticas.html
+🏛️ PARTICIONES MÓVILES ACÚSTICAS
+• Sistemas de divisiones móviles y plegables
+• Aislamiento acústico: hasta 52 dB de reducción de ruido
+• Operación: manual o motorizada
+• Acabados: tela, madera, laminado, vidrio
+• Altura: hasta 6 metros
+• Aplicaciones: salas de conferencias, hoteles, auditorios, colegios, restaurantes
+• Enlace: https://dklicrd.com/Particiones_Acusticas.html
 
-   🏨 PRODUCTOS PARA HOTELES
-   • Línea completa de soluciones para la industria hotelera
-   • Incluye: cerraduras de tarjeta/RFID, puertas de habitación, divisiones, accesorios
-   • Sistemas de control de acceso para habitaciones
-   • Puertas cortafuego para pasillos y escaleras
-   • Divisiones de baño para áreas comunes
-   • Particiones para salones de eventos
-   • Aplicaciones: hoteles, resorts, apartamentos turísticos
-   • Enlace: https://dklicrd.com/Productos_Hoteles.html
+🏨 PRODUCTOS PARA HOTELES
+• Línea completa de soluciones para la industria hotelera
+• Incluye: cerraduras de tarjeta/RFID, puertas de habitación, divisiones, accesorios
+• Sistemas de control de acceso para habitaciones
+• Puertas cortafuego para pasillos y escaleras
+• Divisiones de baño para áreas comunes
+• Particiones para salones de eventos
+• Aplicaciones: hoteles, resorts, apartamentos turísticos
+• Enlace: https://dklicrd.com/Productos_Hoteles.html
 
-   🔮 PARTICIONES DE VIDRIO
-   • Sistemas de divisiones en vidrio templado y laminado
-   • Tipos: fijas, corredizas, plegables, frameless (sin marco)
-   • Vidrio: templado 8-12mm, laminado, con o sin tratamiento
-   • Perfiles: aluminio anodizado, acero inoxidable
-   • Acabados: transparente, esmerilado, satinado, tintado
-   • Aplicaciones: oficinas, locales comerciales, restaurantes, showrooms
-   • Enlace: https://dklicrd.com/Particiones_Vidrios.html
+🔮 PARTICIONES DE VIDRIO
+• Sistemas de divisiones en vidrio templado y laminado
+• Tipos: fijas, corredizas, plegables, frameless (sin marco)
+• Vidrio: templado 8-12mm, laminado, con o sin tratamiento
+• Perfiles: aluminio anodizado, acero inoxidable
+• Acabados: transparente, esmerilado, satinado, tintado
+• Aplicaciones: oficinas, locales comerciales, restaurantes, showrooms
+• Enlace: https://dklicrd.com/Particiones_Vidrios.html
 
-   Para cada categoría:
-   ✓ Describe las características relevantes según lo que pregunte el cliente
-   ✓ Menciona aplicaciones o usos comunes
-   ✓ Ofrece el enlace para más información
-   ✓ Pregunta si desea una cotización formal
-   ✗ NUNCA muestres precios sin solicitud explícita
+════════════════════════════════════════════════════════════
 
-5. FLUJO DE APROBACIÓN (automático):
-   - Cuando completes una cotización, el sistema enviará automáticamente:
-     * La cotización al propietario para aprobación
-     * Un mensaje al cliente: Su solicitud de cotización ha sido recibida. En breve recibirá su cotización formal. Gracias por contactar a DKLIC PLUS INVESTMENT!
-   - El propietario responderá con APROBAR o RECHAZAR
-   - Si APROBAR: se enviará la cotización completa al cliente
-   - Si RECHAZAR: se notificará al cliente
-
-CATÁLOGO COMPLETO (usar solo cuando se solicite):
+CATÁLOGO DE PRECIOS (usar SOLO cuando se solicite cotización):
 ${productList}
 
 NOTAS PARA COTIZACIONES:
@@ -479,14 +503,19 @@ app.get('/webhook', (req, res) => {
 
 // ============================================================
 // WEBHOOK MENSAJES (POST)
+// FIX PROBLEMA 1: Responder 200 INMEDIATAMENTE antes de procesar
+// para evitar que Meta reintente el envío y cause duplicados.
 // ============================================================
 app.post('/webhook', (req, res) => {
-  // Responder inmediatamente a Meta
+  // CRÍTICO: Responder 200 OK a Meta de forma INMEDIATA
+  // Si no respondemos rápido, Meta reintenta y causa mensajes duplicados
   res.status(200).send('EVENT_RECEIVED');
 
-  // Procesar de forma asíncrona
-  processMessage(req.body).catch(err => {
-    console.error('[Webhook] Error processing message:', err);
+  // Procesar de forma asíncrona DESPUÉS de responder
+  setImmediate(() => {
+    processMessage(req.body).catch(err => {
+      console.error('[Webhook] Error processing message:', err);
+    });
   });
 });
 
@@ -510,11 +539,23 @@ async function processMessage(body) {
     const messages = value?.messages;
 
     if (!messages || messages.length === 0) {
-      console.log('[Webhook] No messages found');
+      console.log('[Webhook] No messages found (puede ser status update, ignorando)');
       return;
     }
 
     for (const message of messages) {
+      // FIX PROBLEMA 1: Deduplicación por message.id
+      // Meta puede reenviar el mismo mensaje si hubo timeout o error de red
+      const messageId = message.id;
+      if (messageId && isMessageAlreadyProcessed(messageId)) {
+        console.log(`[Webhook] ⚠️ Mensaje duplicado ignorado: ${messageId}`);
+        continue;
+      }
+      if (messageId) {
+        markMessageAsProcessed(messageId);
+        console.log(`[Webhook] Procesando mensaje ID: ${messageId}`);
+      }
+
       if (message.type !== 'text') {
         console.log('[Webhook] Skipping non-text message:', message.type);
         continue;
@@ -556,15 +597,16 @@ async function processMessage(body) {
         // Agregar respuesta al historial
         addToHistory(waId, 'assistant', response);
 
-        // Enviar respuesta por WhatsApp
+        // Enviar respuesta por WhatsApp (UN SOLO ENVÍO)
         await sendWhatsAppMessage(waId, response);
         console.log(`[Webhook] ✅ Response sent to ${waId}`);
-        
-        // Verificar si la respuesta contiene indicador de cotización completa
+
+        // FIX PROBLEMA 1: Verificar cotización DESPUÉS del envío principal
+        // SOLO enviar mensaje de confirmación al cliente (NO enviar la respuesta de Gemini de nuevo)
         if (response.includes('ITBIS') && response.includes('TOTAL')) {
-          // Enviar mensaje de confirmación al cliente
-          await sendWhatsAppMessage(waId, 'Su solicitud de cotización ha sido recibida. En breve recibirá su cotización formal. ¡Gracias por contactar a DKLIC PLUS INVESTMENT!');
-          // Enviar a aprobación del propietario
+          console.log('[Quotation] Cotización detectada, enviando a aprobación...');
+          // Enviar a aprobación del propietario (sin mensaje adicional al cliente,
+          // ya que Gemini ya incluyó toda la información en su respuesta)
           await handleQuotationReady(waId, response);
         }
 
@@ -591,28 +633,25 @@ async function processMessage(body) {
 // ============================================================
 async function handleQuotationReady(clientWaId, quotationText) {
   try {
-    // Crear ID de cotización
     const quotationId = createQuotationId();
-    
-    // Guardar cotización pendiente
+
     pendingQuotations.set(quotationId, {
       clientWaId,
       quotationText,
       status: 'pending',
       createdAt: new Date()
     });
-    
+
     console.log(`[Quotation] Created quotation ${quotationId} for client ${clientWaId}`);
-    
-    // Enviar a aprobación del propietario
+
+    // Notificar al propietario para aprobación
     const approvalMessage = `📋 *COTIZACIÓN PENDIENTE DE APROBACIÓN*\n\nCliente: ${clientWaId}\nCotización ID: ${quotationId}\n\n${quotationText}\n\nResponde *APROBAR* para enviarla al cliente o *RECHAZAR* para cancelarla.`;
-    
+
     await sendWhatsAppMessage(OWNER_PHONE, approvalMessage);
     console.log(`[Quotation] Approval request sent to owner for ${quotationId}`);
-    
-    // Guardar el ID de cotización en la conversación del cliente para referencia futura
+
     addToHistory(clientWaId, 'system', `quotation_id:${quotationId}`);
-    
+
   } catch (err) {
     console.error('[Quotation] Error handling quotation:', err.message);
   }
@@ -623,7 +662,7 @@ async function handleOwnerResponse(ownerWaId, action) {
     // Encontrar la cotización más reciente pendiente
     let quotationId = null;
     let quotationData = null;
-    
+
     for (const [qId, qData] of pendingQuotations.entries()) {
       if (qData.status === 'pending') {
         quotationId = qId;
@@ -631,41 +670,33 @@ async function handleOwnerResponse(ownerWaId, action) {
         break;
       }
     }
-    
+
     if (!quotationId || !quotationData) {
       await sendWhatsAppMessage(ownerWaId, '❌ No hay cotizaciones pendientes de aprobación.');
       return;
     }
-    
+
     if (action === 'APROBAR') {
-      // Aprobar cotización
       quotationData.status = 'approved';
-      
-      // Enviar cotización al cliente
+
       const clientMessage = `✅ *SU COTIZACIÓN HA SIDO APROBADA*\n\n${quotationData.quotationText}\n\nPara confirmar su pedido, por favor contáctenos al +1 (809) 555-0100 o a ventas@dklicrd.com`;
-      
+
       await sendWhatsAppMessage(quotationData.clientWaId, clientMessage);
-      
-      // Confirmar al propietario
       await sendWhatsAppMessage(ownerWaId, `✅ Cotización ${quotationId} enviada al cliente.`);
-      
+
       console.log(`[Quotation] Quotation ${quotationId} approved and sent to client`);
-      
+
     } else if (action === 'RECHAZAR') {
-      // Rechazar cotización
       quotationData.status = 'rejected';
-      
-      // Notificar al cliente
+
       const clientMessage = `⚠️ Su solicitud de cotización ha sido revisada. Por favor contáctenos directamente al +1 (809) 555-0100 para más información.`;
-      
+
       await sendWhatsAppMessage(quotationData.clientWaId, clientMessage);
-      
-      // Confirmar al propietario
       await sendWhatsAppMessage(ownerWaId, `❌ Cotización ${quotationId} rechazada.`);
-      
+
       console.log(`[Quotation] Quotation ${quotationId} rejected`);
     }
-    
+
   } catch (err) {
     console.error('[Owner] Error handling owner response:', err.message);
     try {
